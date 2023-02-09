@@ -9,55 +9,120 @@
  *      - For failing tests, print out a nice summary of the errors for each file
  */
 
-use aml::{AmlContext, DebugVerbosity};
-use clap::{App, Arg};
+use aml::{AmlContext, DebugVerbosity, AmlError};
+use clap::{Arg, ArgGroup, ArgAction};
 use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{Read, Write},
     ops::Not,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
+
+enum CompilationOutcome {
+    DoesNotExist,
+    Ignored,
+    IsAml(PathBuf),
+    Newer(PathBuf),
+    NotCompiled(PathBuf),
+    Failed(PathBuf),
+    Succeeded(PathBuf),
+}
 
 fn main() -> std::io::Result<()> {
     log::set_logger(&Logger).unwrap();
     log::set_max_level(log::LevelFilter::Trace);
 
-    let matches = App::new("aml_tester")
+    let matches = clap::Command::new("aml_tester")
         .version("v0.1.0")
         .author("Isaac Woods")
         .about("Compiles and tests ASL files")
-        .arg(Arg::with_name("path").short("p").long("path").required(true).takes_value(true))
-        .arg(Arg::with_name("no_compile").long("no-compile"))
+        .arg(Arg::new("no_compile").long("no-compile").action(ArgAction::SetTrue).help("Don't compile asl to aml"))
+        .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue).help("Clear namespace after each file"))
+        .arg(Arg::new("path").short('p').long("path").required(false).action(ArgAction::Set).value_name("DIR"))
+        .arg(Arg::new("files").action(ArgAction::Append).value_name("FILE.{asl,aml}"))
+        .group(ArgGroup::new("files_list").args(["path", "files"]).required(true))
         .get_matches();
 
-    let dir_path = Path::new(matches.value_of("path").unwrap());
-    println!("Running tests in directory: {:?}", dir_path);
+    let files: Vec<String> = if matches.contains_id("path") {
+        let dir_path = Path::new(matches.get_one::<String>("path").unwrap());
+        println!("Running tests in directory: {:?}", dir_path);
+        fs::read_dir(dir_path)?.filter_map(| entry | if entry.is_ok() {
+            Some(entry.unwrap().path().to_string_lossy().to_string())
+        } else {
+            None
+        }).collect()
+    } else {
+        matches.get_many::<String>("files").unwrap_or_default().map(| f | f.to_string()).collect()
+    };
 
-    if !matches.is_present("no_compile") {
-        let (passed, failed) = compile_asl_files(dir_path)?;
-        println!("Compiled {} ASL files: {} passed, {} failed.", passed + failed, passed, failed);
+    if !files.iter().fold(true, | had_failure, file | {
+        if Path::new(file).is_file() {
+            had_failure
+        } else {
+            println!("File not found: {}", file);
+            false
+        }
+    }) {
+        return Ok(());
     }
 
-    /*
-     * Now, we find all the AML files in the directory, and try to compile them with the `aml`
-     * parser.
-     */
-    let aml_files = fs::read_dir(dir_path)?
-        .filter(|entry| entry.is_ok() && entry.as_ref().unwrap().path().extension() == Some(OsStr::new("aml")))
-        .map(Result::unwrap);
+    let user_wants_compile = !matches.get_flag("no_compile");
+    let can_compile = if !user_wants_compile {
+        false
+    } else {
+        // Test if `iasl` is installed, so we can give a good error later if it's not
+        match Command::new("iasl").arg("-v").status() {
+            Ok(exit_status) if exit_status.success() => true,
+            Ok(exit_status) => {
+                panic!("`iasl` exited with unsuccessfull status: {:?}", exit_status);
+            },
+            Err(_) => false,
+        }
+    };
+
+    let compiled_files: Vec<CompilationOutcome> = files.iter().map(| file | resolve_and_compile(file, can_compile).unwrap()).collect();
+
+    // check compilation should have happened but did not
+    if user_wants_compile && compiled_files.iter().any(| outcome | matches!(outcome, CompilationOutcome::NotCompiled(_))) {
+        panic!("`iasl` is not installed, but we want to compile some ASL files! Pass --no-compile, or install `iasl`")
+    }
+    if user_wants_compile {
+        let (passed, failed) = compiled_files.iter()
+            .fold((0, 0), | (passed, failed), outcome | match outcome {
+                CompilationOutcome::Succeeded(_) => (passed + 1, failed),
+                CompilationOutcome::Failed(_) => (passed, failed + 1),
+                _ => (passed, failed),
+            });
+        if passed + failed > 0 {
+            println!("Compiled {} ASL files: {} passed, {} failed.", passed + failed, passed, failed);
+        }
+    }
+
+    let aml_files = compiled_files.iter().filter_map(| outcome | match outcome {
+        CompilationOutcome::IsAml(path) => Some(path),
+        CompilationOutcome::Newer(path) => Some(path),
+        CompilationOutcome::Succeeded(path) => Some(path),
+        _ => None,
+    });
+
+    let reset_context = matches.get_flag("reset");
+    let mut context = AmlContext::new(Box::new(Handler), DebugVerbosity::None);
 
     let (passed, failed) = aml_files.fold((0, 0), |(passed, failed), file_entry| {
-        print!("Testing AML file: {:?}... ", file_entry.path());
+        print!("Testing AML file: {:?}... ", file_entry);
         std::io::stdout().flush().unwrap();
 
-        let mut file = File::open(file_entry.path()).unwrap();
+        let mut file = File::open(file_entry).unwrap();
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).unwrap();
 
         const AML_TABLE_HEADER_LENGTH: usize = 36;
-        let mut context = AmlContext::new(Box::new(Handler), DebugVerbosity::None);
+        
+        if reset_context {
+            context = AmlContext::new(Box::new(Handler), DebugVerbosity::None);
+        }
 
         match context.parse_table(&contents[AML_TABLE_HEADER_LENGTH..]) {
             Ok(()) => {
@@ -78,58 +143,54 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn compile_asl_files(dir_path: &Path) -> std::io::Result<(u32, u32)> {
-    let mut asl_files = fs::read_dir(dir_path)?
-        .filter(|entry| entry.is_ok() && entry.as_ref().unwrap().path().extension() == Some(OsStr::new("asl")))
-        .map(Result::unwrap)
-        .peekable();
+/// Determine what to do with this file - ignore, compile and parse, or just parse.
+/// If ".aml" does not exist, or if ".asl" is newer, compiles the file.
+/// If the ".aml" file is newer, or if the original file is not ".asl",
+/// indicate it is ready to parse. Assumes the file exists.
+fn resolve_and_compile(name: &str, can_compile: bool) -> std::io::Result<CompilationOutcome> {
+    let path = PathBuf::from(name);
 
-    if !asl_files.peek().is_none() {
-        // Test if `iasl` is installed, so we can give a good error if it's not
-        match Command::new("iasl").arg("-v").status() {
-            Ok(exit_status) => if exit_status.success().not() {
-                panic!("`iasl` exited with unsuccessfull status: {:?}", exit_status);
-            },
-            Err(_) => panic!("`iasl` is not installed, but we want to compile some ASL files! Pass --no-compile, or install `iasl`"),
+    // If this file is aml and it exists, it's ready for parsing
+    // metadata() will error if the file does not exist
+    if path.extension() == Some(OsStr::new("aml")) && path.metadata()?.is_file() {
+        return Ok(CompilationOutcome::IsAml(path));
+    }
+
+    // If this file is not asl, it's not interesting. Error if the file does not exist.
+    if path.extension() != Some(OsStr::new("asl")) || !path.metadata()?.is_file() {
+        return Ok(CompilationOutcome::Ignored);
+    }
+
+    if !can_compile {
+        return Ok(CompilationOutcome::NotCompiled(path));
+    }
+    
+    let aml_path = path.with_extension("aml");
+
+    if aml_path.is_file() {
+        let asl_last_modified = path.metadata()?.modified()?;
+        let aml_last_modified = aml_path.metadata()?.modified()?;
+        // If the aml is more recent than the asl, use the existing aml
+        // Otherwise continue to compilation
+        if asl_last_modified <= aml_last_modified {
+            return Ok(CompilationOutcome::Newer(aml_path))
         }
     }
 
-    let mut passed = 0;
-    let mut failed = 0;
+    // Compile the ASL file using `iasl`
+    println!("Compiling file: {}", name);
+    let output = Command::new("iasl").arg(name).output()?;
 
-    for file in asl_files {
-        let aml_path = file.path().with_extension(OsStr::new("aml"));
-
-        /*
-         * Check if an AML path with a matching last-modified date exists. If it
-         * does, we don't need to compile the ASL file again.
-         */
-        if aml_path.is_file() {
-            let asl_last_modified = file.metadata()?.modified()?;
-            let aml_last_modified = aml_path.metadata()?.modified()?;
-
-            if asl_last_modified <= aml_last_modified {
-                continue;
-            }
-        }
-
-        // Compile the ASL file using `iasl`
-        println!("Compiling file: {}", file.path().to_str().unwrap());
-        let output = Command::new("iasl").arg(file.path()).output()?;
-
-        if output.status.success() {
-            passed += 1;
-        } else {
-            failed += 1;
-            println!(
-                "Failed to compile ASL file: {}. Output from iasl:\n {}",
-                file.path().to_str().unwrap(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    if !output.status.success() {
+        println!(
+            "Failed to compile ASL file: {}. Output from iasl:\n {}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(CompilationOutcome::Failed(path))
+    } else {
+        Ok(CompilationOutcome::Succeeded(aml_path))
     }
-
-    Ok((passed, failed))
 }
 
 struct Logger;
