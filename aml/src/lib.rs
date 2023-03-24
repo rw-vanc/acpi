@@ -35,7 +35,7 @@
 //! combinator patterns to express the parse.
 
 #![no_std]
-#![feature(decl_macro, type_ascription)]
+#![feature(decl_macro)]
 
 extern crate alloc;
 
@@ -814,6 +814,9 @@ pub enum AmlError {
     TypeCannotBeSliced(AmlType),
     TypeCannotBeWrittenToBufferField(AmlType),
     BufferFieldIndexesOutOfBounds,
+
+    /// Unimplemented functionality - return error rather than abort
+    Unimplemented,
 }
 
 #[cfg(test)]
